@@ -87,9 +87,13 @@ pub mod sectors_manager_public {
 }
 
 pub mod transfer_public {
-    use crate::RegisterCommand;
+    use crate::{RegisterCommand,
+        ClientRegisterCommand, ClientRegisterCommandContent,
+        SystemRegisterCommand,
+        MAGIC_NUMBER};
     use std::io::Error;
-    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use hmac::{Hmac, Mac};
 
     pub async fn deserialize_register_command(
         data: &mut (dyn AsyncRead + Send + Unpin),
@@ -101,6 +105,60 @@ pub mod transfer_public {
 
     pub async fn serialize_register_command(
         cmd: &RegisterCommand,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), Error> {
+        match cmd {
+            RegisterCommand::Client(client_cmd) => {
+                serialize_client_command(client_cmd, writer, hmac_key).await
+            }
+            RegisterCommand::System(system_cmd) => {
+                serialize_system_command(system_cmd, writer, hmac_key).await
+            }
+        }
+    }
+
+    async fn serialize_client_command(
+        cmd: &ClientRegisterCommand,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), Error> {
+        let mut serialized: Vec<u8> = Vec::new();
+        serialized.extend_from_slice(&MAGIC_NUMBER);
+        serialized.extend_from_slice(&[0u8; 3]);
+        let mut content = Vec::new();
+        match cmd.content {
+            ClientRegisterCommandContent::Read => {
+                serialized.push(1);
+            }
+            ClientRegisterCommandContent::Write { ref data } => {
+                serialized.push(2);
+                content.extend_from_slice(data.0.as_slice());
+            }
+        }
+        // HEADER END
+        serialized.extend_from_slice(
+            cmd.header.request_identifier.to_be_bytes().as_ref());
+        // IDENTIFIER END
+        serialized.extend_from_slice(
+            cmd.header.sector_idx.to_be_bytes().as_ref());
+        // SECTOR IDX END
+        serialized.extend_from_slice(content.as_slice());
+        // CONTENT END
+        let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(hmac_key)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "HMAC error"))?;
+        hmac.update(&serialized);
+        let hmac_bytes = hmac.finalize().into_bytes();
+        serialized.extend_from_slice(&hmac_bytes);
+        // HMAC END
+        // MESSAGE END
+
+        writer.write_all(serialized.as_slice()).await?;
+        return Ok(());
+    }
+    
+    async fn serialize_system_command(
+        cmd: &SystemRegisterCommand,
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         hmac_key: &[u8],
     ) -> Result<(), Error> {
