@@ -97,7 +97,7 @@ pub mod transfer_public {
         hmac_system_key: &[u8; 64],
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), Error> {
-        unimplemented!()
+        transfer_lib::deserialize_data(data, hmac_system_key, hmac_client_key).await
     }
 
     pub async fn serialize_register_command(
