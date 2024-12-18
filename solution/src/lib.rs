@@ -105,16 +105,8 @@ pub mod transfer_public {
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         hmac_key: &[u8],
     ) -> Result<(), Error> {
-        match cmd {
-            RegisterCommand::Client(client_cmd) => {
-                transfer_lib::serialize_client_command(client_cmd, writer, hmac_key).await
-            }
-            RegisterCommand::System(system_cmd) => {
-                transfer_lib::serialize_system_command(system_cmd, writer, hmac_key).await
-            }
-        }
+        transfer_lib::serialize_command(cmd, writer, hmac_key).await
     }
-
 
 }
 

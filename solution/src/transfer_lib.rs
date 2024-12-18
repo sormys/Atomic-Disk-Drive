@@ -4,7 +4,7 @@ use core::time;
 use std::{io::Error, vec};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use hmac::{Hmac, Mac};
-
+use async_trait::async_trait;
 
 const DATA_SIZE: usize = 4096;
 const MAGIC_NUMBER_LEN: usize = 4;
@@ -89,7 +89,7 @@ async fn deserialize_header(
     return Ok(message_type);
 }
 
-async fn deserialize_message_content(
+async fn deserialize_client_message(
     message_type: ClientMessageType,
     data: &mut (dyn AsyncRead + Send + Unpin),
     received: &mut Vec<u8>) -> Result<RegisterCommand, Error> {
@@ -126,7 +126,7 @@ async fn deserialize_message_content(
         )
 }
 
-async fn deserialize_message_system_content_v(
+async fn deserialize_system_message_content(
     data: &mut (dyn AsyncRead + Send + Unpin),
     received: &mut Vec<u8>
 ) -> Result<(u64, u8, SectorVec), Error> {
@@ -148,12 +148,11 @@ async fn deserialize_message_system_content_v(
     Ok((timestamp_ref, write_rank_ref, sector_data_ref))
 }
 
-async fn deserialize_message_system_content(
+async fn deserialize_system_message(
     message_type: SystemMessageType,
     data: &mut (dyn AsyncRead + Send + Unpin),
     received: &mut Vec<u8>
 ) -> Result<RegisterCommand, Error> {
-    // TODO: add overloading
     let mut uuid_raw = [0u8; 16];
     data.read_exact(&mut uuid_raw).await?;
     received.extend_from_slice(&uuid_raw);
@@ -164,7 +163,7 @@ async fn deserialize_message_system_content(
     
     let header = SystemCommandHeader {
         // Process identifier is in the message header.
-        process_identifier: received[7],
+        process_identifier: received[6],
         msg_ident: uuid::Uuid::from_bytes(uuid_raw),
         sector_idx: u64::from_be_bytes(sector_idx),
     };
@@ -173,7 +172,7 @@ async fn deserialize_message_system_content(
         SystemMessageType::ReadProc => SystemRegisterCommandContent::ReadProc,
         SystemMessageType::Value => {
             let (timestamp, write_rank, sector_data) = 
-                deserialize_message_system_content_v(data, received).await?;
+                deserialize_system_message_content(data, received).await?;
             SystemRegisterCommandContent::Value {
                 timestamp: timestamp,
                 write_rank: write_rank,
@@ -182,7 +181,7 @@ async fn deserialize_message_system_content(
         }
         SystemMessageType::WriteProc => {
             let (timestamp, write_rank, data_to_write) = 
-                deserialize_message_system_content_v(data, received).await?;
+                deserialize_system_message_content(data, received).await?;
             SystemRegisterCommandContent::WriteProc {
                 timestamp: timestamp,
                 write_rank: write_rank,
@@ -225,25 +224,51 @@ pub async fn deserialize_data(
     let cmd = match message_type {
         MessageType::Client(client_message_type) => {
             hmac_key = hmac_client_key.to_vec();
-            deserialize_message_content(client_message_type, data, &mut received).await?
+            deserialize_client_message(client_message_type, data, &mut received).await?
         }
         MessageType::System(system_message_type) => {
             hmac_key = hmac_system_key.to_vec();
-            deserialize_message_system_content(system_message_type, data, &mut received).await?
+            deserialize_system_message(system_message_type, data, &mut received).await?
         }
     };
-    print!("Received: {:?}", received);
+
     let hmac_valid = verify_hmac(data, &received, &hmac_key).await?;
     Ok((cmd, hmac_valid))
 }
 
 // SERIALIZATION
 
-pub async fn serialize_client_command(
-    cmd: &ClientRegisterCommand,
+#[async_trait]
+trait SerializeCommand {
+    async fn serialize(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), Error>;
+}
+
+pub async fn serialize_command(
+    cmd: &RegisterCommand,
     writer: &mut (dyn AsyncWrite + Send + Unpin),
     hmac_key: &[u8],
 ) -> Result<(), Error> {
+    match cmd {
+        RegisterCommand::Client(client_cmd) => {
+            client_cmd.serialize(writer, hmac_key).await
+        }
+        RegisterCommand::System(system_cmd) => {
+            system_cmd.serialize(writer, hmac_key).await
+        }
+    }
+}
+
+#[async_trait]
+impl SerializeCommand for ClientRegisterCommand {
+    async fn serialize(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), Error> {
     let mut serialized: Vec<u8> = Vec::new();
     // Magic number
     serialized.extend_from_slice(&MAGIC_NUMBER);
@@ -251,7 +276,7 @@ pub async fn serialize_client_command(
     serialized.extend_from_slice(&[0u8; Padding::ClientCommand as usize]);
     // Message type + store content
     let mut content = Vec::new();
-    match cmd.content {
+    match self.content {
         ClientRegisterCommandContent::Read => {
             serialized.push(1);
         }
@@ -266,9 +291,9 @@ pub async fn serialize_client_command(
     }
     // Identifier
     serialized.extend_from_slice(
-        &cmd.header.request_identifier.to_be_bytes());
+        &self.header.request_identifier.to_be_bytes());
     // Sector index
-    serialized.extend_from_slice(&cmd.header.sector_idx.to_be_bytes());
+    serialized.extend_from_slice(&self.header.sector_idx.to_be_bytes());
     // Store content
     serialized.extend_from_slice(content.as_slice());
     // Hmac
@@ -278,9 +303,9 @@ pub async fn serialize_client_command(
     let hmac_bytes = hmac.finalize().into_bytes();
     serialized.extend_from_slice(&hmac_bytes);
 
-    print!("Serialized: {:?}", serialized);
     writer.write_all(serialized.as_slice()).await?;
     return Ok(());
+    }
 }
 
 pub fn append_system_command_content(
@@ -301,70 +326,73 @@ pub fn append_system_command_content(
     return Ok(());
 }
 
-pub async fn serialize_system_command(
-    cmd: &SystemRegisterCommand,
-    writer: &mut (dyn AsyncWrite + Send + Unpin),
-    hmac_key: &[u8],
-) -> Result<(), Error> {
-    let mut serialized: Vec<u8> = Vec::new();
-    // Magic number
-    serialized.extend_from_slice(&MAGIC_NUMBER);
-    // Padding
-    serialized.extend_from_slice(&[0u8; Padding::SystemCommand as usize]);
-    // Unpack header
-    let SystemCommandHeader {
-        process_identifier,
-        msg_ident,
-        sector_idx,
-    } = cmd.header;
-    // Unpack content
-    let mut content: Vec<u8> = Vec::new();
-    let message_type: u8 = match &cmd.content {
-        SystemRegisterCommandContent::ReadProc => {
-            3
-        }
-        SystemRegisterCommandContent::Value {
-            timestamp,
-            write_rank,
-            sector_data,
-        } => {
-            append_system_command_content(
-                &mut content, timestamp, write_rank, sector_data)?;
-            4
-        }
-        SystemRegisterCommandContent::WriteProc {
-            timestamp,
-            write_rank,
-            data_to_write,
-        } => {
-            append_system_command_content(
-                &mut content,timestamp, write_rank, data_to_write)?;
-            5
-        }
-        SystemRegisterCommandContent::Ack => {
-            6
-        }
-    };
-    // Process rank
-    serialized.extend_from_slice(&process_identifier.to_be_bytes());
-    // Message Type
-    serialized.extend_from_slice(&message_type.to_be_bytes());
-    // UUID
-    let mut uuid_bytes = msg_ident.as_bytes().clone();
-    uuid_bytes.reverse();
-    serialized.extend_from_slice(&uuid_bytes);
-    // Sector index
-    serialized.extend_from_slice(&sector_idx.to_be_bytes());
-    // Store content
-    serialized.extend_from_slice(content.as_slice());
-    // Hmac
-    let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(hmac_key)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Sending message HMAC error"))?;
-    hmac.update(&serialized);
-    let hmac_bytes = hmac.finalize().into_bytes();
-    serialized.extend_from_slice(&hmac_bytes);
+#[async_trait]
+impl SerializeCommand for SystemRegisterCommand {
+    async fn serialize(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), Error> {
+        let mut serialized: Vec<u8> = Vec::new();
+        // Magic number
+        serialized.extend_from_slice(&MAGIC_NUMBER);
+        // Padding
+        serialized.extend_from_slice(&[0u8; Padding::SystemCommand as usize]);
+        // Unpack header
+        let SystemCommandHeader {
+            process_identifier,
+            msg_ident,
+            sector_idx,
+        } = self.header;
+        // Unpack content
+        let mut content: Vec<u8> = Vec::new();
+        let message_type: u8 = match &self.content {
+            SystemRegisterCommandContent::ReadProc => {
+                3
+            }
+            SystemRegisterCommandContent::Value {
+                timestamp,
+                write_rank,
+                sector_data,
+            } => {
+                append_system_command_content(
+                    &mut content, timestamp, write_rank, sector_data)?;
+                4
+            }
+            SystemRegisterCommandContent::WriteProc {
+                timestamp,
+                write_rank,
+                data_to_write,
+            } => {
+                append_system_command_content(
+                    &mut content,timestamp, write_rank, data_to_write)?;
+                5
+            }
+            SystemRegisterCommandContent::Ack => {
+                6
+            }
+        };
+        // Process rank
+        serialized.extend_from_slice(&process_identifier.to_be_bytes());
+        // Message Type
+        serialized.extend_from_slice(&message_type.to_be_bytes());
+        // UUID
+        let mut uuid_bytes = msg_ident.as_bytes().clone();
+        uuid_bytes.reverse();
+        serialized.extend_from_slice(&uuid_bytes);
+        // Sector index
+        serialized.extend_from_slice(&sector_idx.to_be_bytes());
+        // Store content
+        serialized.extend_from_slice(content.as_slice());
+        // Hmac
+        let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(hmac_key)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Sending message HMAC error"))?;
+        hmac.update(&serialized);
+        let hmac_bytes = hmac.finalize().into_bytes();
+        serialized.extend_from_slice(&hmac_bytes);
 
-    writer.write_all(serialized.as_slice()).await?;
+        writer.write_all(serialized.as_slice()).await?;
 
-    return Ok(());
+        return Ok(());
+    }
 }
