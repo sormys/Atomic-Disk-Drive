@@ -1,5 +1,6 @@
 mod domain;
 mod transfer_lib;
+mod sectors_manager;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -63,6 +64,7 @@ pub mod atomic_register_public {
 }
 
 pub mod sectors_manager_public {
+    use crate::sectors_manager;
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -83,7 +85,7 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        unimplemented!()
+        return Arc::new(sectors_manager::BasicSectorsManager::new(&path).await);
     }
 }
 
