@@ -1,6 +1,7 @@
 mod domain;
 mod transfer_lib;
 mod sectors_manager;
+mod atomic_register;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -14,8 +15,7 @@ pub async fn run_register_process(config: Configuration) {
 
 pub mod atomic_register_public {
     use crate::{
-        ClientRegisterCommand, OperationSuccess, RegisterClient, SectorIdx, SectorsManager,
-        SystemRegisterCommand,
+        atomic_register, ClientRegisterCommand, OperationSuccess, RegisterClient, SectorIdx, SectorsManager, SystemRegisterCommand
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -59,7 +59,13 @@ pub mod atomic_register_public {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
     ) -> Box<dyn AtomicRegister> {
-        unimplemented!()
+        return Box::new(atomic_register::BasicAtomicRegister::new(
+            self_ident,
+            sector_idx,
+            register_client,
+            sectors_manager,
+            processes_count,
+        ));
     }
 }
 
