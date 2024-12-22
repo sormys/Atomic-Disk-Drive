@@ -1,12 +1,9 @@
 // implementation of the SectorManager struct
-use crate::sectors_manager_public::{self, SectorsManager};
-use crate::{SectorVec, StatusCode};
-use crate::domain::Configuration;
-use core::{sync, time};
-use std::path::{Path, PathBuf};
+use crate::sectors_manager_public::SectorsManager;
+use crate::SectorVec;
+use std::path::PathBuf;
 use sha2::{Sha256, Digest};
 use tokio::{fs::rename, io::{AsyncWriteExt, AsyncReadExt}};
-use std::io::IoSlice;
 
 const TMP_SUFFIX: &str = "_tmp";
 const META_EXTENSION: &str = "meta";
@@ -157,6 +154,10 @@ impl SectorsManager for BasicSectorsManager {
     async fn read_data(&self, idx: u64) -> SectorVec {
         let sector_dir = get_sector_dir(self.config_storage_dir.clone(), idx);
         let sector_data_path = get_sector_data_path(sector_dir);
+        if !sector_data_path.exists() {
+            // No write yet.
+            return SectorVec(vec![0; 4096]);
+        }
         let sector_data = tokio::fs::read(sector_data_path).await.unwrap();
         SectorVec(sector_data)
     }
@@ -171,6 +172,10 @@ impl SectorsManager for BasicSectorsManager {
                 metadata = Some(path);
                 break;
             }
+        }
+        if metadata.is_none() {
+            // No write yet.
+            return (0, 0);
         }
         decode_metadata(&metadata.unwrap())
     }
@@ -229,11 +234,11 @@ impl BasicSectorsManager {
         let storage = BasicSectorsManager {
             config_storage_dir: storage_dir.clone(),
         };
-        storage.full_recovery().await.unwrap();
+        storage.full_recovery().await;
         storage
     }
 
-    async fn full_recovery(&self) -> Result<(), ()> {
+    async fn full_recovery(&self){
         if !self.config_storage_dir.exists() {
             tokio::fs::create_dir(&self.config_storage_dir).await.unwrap();
         }
@@ -243,6 +248,5 @@ impl BasicSectorsManager {
             let sector_dir = entry.path();
             recover_dir(&sector_dir).await;
         }
-        Ok(())
     }
 }
