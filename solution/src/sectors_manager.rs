@@ -80,7 +80,6 @@ async fn safe_delete(dir_path: &PathBuf, path: &PathBuf) {
 }
 
 async fn recover_dir(dir_path: &PathBuf) {
-    // find if there is tmp file
     let mut tmp_file = None;
     let mut tmp_metadata = None;
     let mut meata_data_files: Vec<PathBuf> = Vec::new();
@@ -121,13 +120,11 @@ async fn recover_dir(dir_path: &PathBuf) {
     }
 
     let tmp_file = tmp_file.unwrap();
-    // check checksum
     let mut data_file = tokio::fs::File::open(&tmp_file).await.unwrap();
     let mut data = Vec::new();
     data_file.read_to_end(&mut data).await.unwrap();
-    // Check if file content length is 4096 + 32
+    // Check if file content length is data size + checksum size
     if data.len() != 4096 + 32 {
-        // File is corrupted
         safe_delete(&dir_path, &tmp_file).await;
         return;
     }
@@ -140,6 +137,7 @@ async fn recover_dir(dir_path: &PathBuf) {
         return;
     }
     
+    // We have to recover from tmp file.
     let data_file_path = get_sector_data_path(dir_path.clone());
     safe_write(dir_path, &data_file_path, vec![&pure_data]).await;
 
