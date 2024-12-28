@@ -1,3 +1,5 @@
+use base64::read;
+
 use crate::atomic_register_public::AtomicRegister;
 use crate::{register_client_public, sectors_manager};
 use crate::register_client_public::RegisterClient;
@@ -19,7 +21,7 @@ pub(crate) struct BasicAtomicRegister {
     sectors_manager: Arc<dyn SectorsManager>,
     processes_count: u8,
     reading: bool,
-    writig: bool,
+    writing: bool,
     writing_data: Option<SectorVec>,
     write_phase: bool,
     read_list: Vec<Option<(u64, u8, SectorVec)>>,
@@ -50,7 +52,7 @@ impl BasicAtomicRegister {
             sectors_manager,
             processes_count,
             reading: false,
-            writig: false,
+            writing: false,
             writing_data: None,
             write_phase: false,
             read_list: vec![None; processes_count as usize],
@@ -127,13 +129,13 @@ impl AtomicRegister for BasicAtomicRegister {
                 }
             }
             ClientRegisterCommandContent::Write { data } => {
-                self.writig = true;
+                self.writing = true;
                 self.writing_data = Some(data);
                 register_client_public::Broadcast {
                     cmd: Arc::new(SystemRegisterCommand{
                         header: SystemCommandHeader{
                             process_identifier: self.self_ident,
-                            msg_ident: self.op_id,
+                            msg_ident: self.op_id.clone(),
                             sector_idx: self.sector_idx,
                         },
                         content: SystemRegisterCommandContent::ReadProc,
@@ -173,13 +175,17 @@ impl AtomicRegister for BasicAtomicRegister {
                 if self.op_id != cmd.header.msg_ident || self.write_phase {
                     return;
                 }
-                self.read_list[process_id as usize] = Some((timestamp, write_rank, sector_data));
-                // TODO: what if message doubled?
+                let read_list_value = Some((timestamp, write_rank, sector_data));
+                if read_list_value == self.read_list[(process_id - 1) as usize] {
+                    // Trying to handle doubled messages
+                    return;
+                }
+                self.read_list[(process_id - 1) as usize] = read_list_value;
                 self.read_list_num += 1;
-                if self.read_list_num > self.processes_count / 2 && (self.reading || self.writig) {
+                if self.read_list_num > self.processes_count / 2 && (self.reading || self.writing) {
                     let (ts, wr) = self.sectors_manager.read_metadata(self.sector_idx).await;
                     let data = self.sectors_manager.read_data(self.sector_idx).await;
-                    self.read_list[self.self_ident as usize] = Some((ts, wr, data));
+                    self.read_list[(self.self_ident - 1) as usize] = Some((ts, wr, data));
 
                     let highest_idx = highest(&self.read_list);
                     let (mut maxts, mut rr, mut readval) = self.read_list[highest_idx as usize].take().unwrap();
@@ -200,7 +206,7 @@ impl AtomicRegister for BasicAtomicRegister {
                         cmd: Arc::new(SystemRegisterCommand{
                             header: SystemCommandHeader{
                                 process_identifier: self.self_ident,
-                                msg_ident: self.op_id,
+                                msg_ident: cmd.header.msg_ident,
                                 sector_idx: self.sector_idx,
                             },
                             content: SystemRegisterCommandContent::WriteProc { 
@@ -230,14 +236,18 @@ impl AtomicRegister for BasicAtomicRegister {
                 }).await;
             }
             SystemRegisterCommandContent::Ack => {
+                // 5
                 if cmd.header.msg_ident != self.op_id || !self.write_phase {
                     return;
                 }
 
-                self.ack_list[process_id as usize] = true;
-                // TODO: what if message doubled?
+                if self.ack_list[(process_id - 1) as usize] {
+                    // Trying to handle doubled messages
+                    return;
+                }
+                self.ack_list[(process_id - 1) as usize] = true;
                 self.ack_list_num += 1;
-                if self.ack_list_num > self.processes_count / 2 && (self.writig || self.reading) {
+                if self.ack_list_num > self.processes_count / 2 && (self.writing || self.reading) {
                     self.reset_ack_list();
                     self.write_phase = false;
                     let op_ret = if self.reading {
@@ -246,13 +256,14 @@ impl AtomicRegister for BasicAtomicRegister {
                                 read_data: self.read_data.take().unwrap(),}
                             )
                     } else {
-                        self.writig = false;
+                        self.writing = false;
                         OperationReturn::Write
                     };
                     let success = OperationSuccess{
                         request_identifier: self.request_identifier,
                         op_return: op_ret,
                     };
+                    // 6
                     self.callback.take().unwrap()(success).await;
                 }
             }

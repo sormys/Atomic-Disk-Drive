@@ -1,7 +1,7 @@
 use crate::{
-    ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, MAGIC_NUMBER};
-use std::{io::Error, vec};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, StatusCode, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, MAGIC_NUMBER};
+use std::{io::Error, sync::Arc, vec};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, sync::Mutex};
 use hmac::{Hmac, Mac};
 use async_trait::async_trait;
 
@@ -13,7 +13,8 @@ enum MessageType {
     System(SystemMessageType),
 }
 
-enum ClientMessageType {
+#[repr(u8)]
+pub(crate) enum ClientMessageType {
     Read = 1,
     Write = 2,
 }
@@ -394,4 +395,37 @@ impl SerializeCommand for SystemRegisterCommand {
 
         return Ok(());
     }
+}
+
+// RESPONSE
+
+pub(crate) async fn send_response(
+    writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>,
+    status_code: StatusCode,
+    msg_type:  u8,
+    request_number: u64,
+    response_content: Option<&SectorVec>,
+    hmac_client_key: [u8; 32],
+) {
+    let mut response = Vec::new();
+    response.extend_from_slice(&MAGIC_NUMBER);
+    response.extend_from_slice(&[0u8; Padding::SystemCommand as usize]);
+    let status_code_raw: u8 = match status_code {
+        StatusCode::Ok => 1,
+        StatusCode::AuthFailure => 2,
+        StatusCode::InvalidSectorIndex => 3,
+    };
+    response.extend_from_slice(&status_code_raw.to_be_bytes());
+    response.push(0x40u8 + msg_type);
+    response.extend_from_slice(&request_number.to_be_bytes());
+    if let Some(content) = response_content {
+        response.extend_from_slice(content.0.as_slice());
+    }
+    let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(&hmac_client_key)
+        .expect("HMAC creation error");
+    hmac.update(&response);
+    let hmac_bytes = hmac.finalize().into_bytes();
+    response.extend_from_slice(&hmac_bytes);
+    let mut writer = writer.lock().await;
+    writer.write_all(&response).await.expect("Response sending error");
 }

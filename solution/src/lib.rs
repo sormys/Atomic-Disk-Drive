@@ -2,7 +2,11 @@ mod domain;
 mod transfer_lib;
 mod sectors_manager;
 mod atomic_register;
+mod register_client;
+mod register_process;
 
+use async_channel::unbounded;
+use register_process::begin_register_process;
 pub use crate::domain::*;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
@@ -10,7 +14,15 @@ pub use sectors_manager_public::*;
 pub use transfer_public::*;
 
 pub async fn run_register_process(config: Configuration) {
-    unimplemented!()
+    let tcp_locations = config.public.tcp_locations.clone();
+    let self_rank = config.public.self_rank;
+
+    let listener = tokio::net::TcpListener::bind(
+        &tcp_locations[self_rank as usize - 1])
+        .await
+        .expect("Failed to bind port.");
+
+    begin_register_process(config, listener).await;
 }
 
 pub mod atomic_register_public {

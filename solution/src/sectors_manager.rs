@@ -8,6 +8,7 @@ use tokio::{fs::rename, io::{AsyncWriteExt, AsyncReadExt}};
 const TMP_SUFFIX: &str = "_tmp";
 const META_EXTENSION: &str = "meta";
 
+#[derive(Clone)]
 pub struct BasicSectorsManager {
     config_storage_dir: PathBuf,
 }
@@ -164,6 +165,10 @@ impl SectorsManager for BasicSectorsManager {
 
     async fn read_metadata(&self, idx: u64) -> (u64, u8) {
         let sector_dir = get_sector_dir(self.config_storage_dir.clone(), idx);
+        if !sector_dir.exists() {
+            // No data about this sector yet.
+            return (0, 0);
+        }
         let mut meta_files = tokio::fs::read_dir(&sector_dir).await.unwrap();
         let mut metadata = None;
         while let Some(entry) = meta_files.next_entry().await.unwrap() {
