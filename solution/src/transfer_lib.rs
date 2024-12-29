@@ -40,53 +40,56 @@ enum Padding {
 pub async fn read_until_magic_number(
     data: &mut (dyn AsyncRead + Send + Unpin),
 ) -> Result<(), Error> {
-    let mut buf = [0u8; MAGIC_NUMBER_LEN];
+    let mut buf = vec![0u8; MAGIC_NUMBER_LEN];
+    let mut pos = 0;
+
     loop {
-        let mut correct = true;
-        for i in 0..MAGIC_NUMBER_LEN {
-            data.read_exact(&mut buf[i..i+1]).await?;
-            if buf[i] != MAGIC_NUMBER[i] {
-                correct = false;
-                break;
-            }
-        }
-        if correct {
-            // We have found the magic number
+        data.read_exact(&mut buf[pos..pos + 1]).await?;
+        pos = (pos + 1) % MAGIC_NUMBER_LEN;
+
+        if buf[pos..].iter().chain(&buf[..pos]).eq(MAGIC_NUMBER.iter()) {
             break;
         }
     }
-    return Ok(());
+
+    Ok(())
 }
 
 async fn deserialize_header(
         data: &mut (dyn AsyncRead + Send + Unpin),
         received: &mut Vec<u8>,
     ) -> Result<MessageType, Error> {
-    read_until_magic_number(data).await?;
-    let mut padding = [0u8; Padding::SystemCommand as usize];
-    data.read_exact(&mut padding).await?;
-    // This may but does not have to be process rank (might just be padding)
-    let mut process_rank = [0u8; 1];
-    let mut message_type_raw = [0u8; 1];
-    data.read_exact(&mut process_rank).await?;
-    data.read_exact(&mut message_type_raw).await?;
+    loop {
+        received.clear();
+        read_until_magic_number(data).await?;
+        let mut padding = [0u8; Padding::SystemCommand as usize];
+        data.read_exact(&mut padding).await?;
+        // This may but does not have to be process rank (might just be padding)
+        let mut process_rank = [0u8; 1];
+        let mut message_type_raw = [0u8; 1];
+        data.read_exact(&mut process_rank).await?;
+        data.read_exact(&mut message_type_raw).await?;
 
-    let message_type = match u8::from_be_bytes(message_type_raw) {
-        1 => MessageType::Client(ClientMessageType::Read),
-        2 => MessageType::Client(ClientMessageType::Write),
-        3 => MessageType::System(SystemMessageType::ReadProc),
-        4 => MessageType::System(SystemMessageType::Value),
-        5 => MessageType::System(SystemMessageType::WriteProc),
-        6 => MessageType::System(SystemMessageType::Ack),
-        _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "Invalid message type")),
-    };
-    
-    // Store received data for HMAC
-    received.extend_from_slice(&MAGIC_NUMBER);
-    received.extend_from_slice(&padding);
-    received.extend_from_slice(&process_rank);
-    received.extend_from_slice(&message_type_raw);
-    return Ok(message_type);
+        let message_type: Option<MessageType> = match u8::from_be_bytes(message_type_raw) {
+            1 => Some(MessageType::Client(ClientMessageType::Read)),
+            2 => Some(MessageType::Client(ClientMessageType::Write)),
+            3 => Some(MessageType::System(SystemMessageType::ReadProc)),
+            4 => Some(MessageType::System(SystemMessageType::Value)),
+            5 => Some(MessageType::System(SystemMessageType::WriteProc)),
+            6 => Some(MessageType::System(SystemMessageType::Ack)),
+            _ => None
+        };
+        if message_type.is_none() {
+            continue;
+        }
+
+        // Store received data for HMAC
+        received.extend_from_slice(&MAGIC_NUMBER);
+        received.extend_from_slice(&padding);
+        received.extend_from_slice(&process_rank);
+        received.extend_from_slice(&message_type_raw);
+        return Ok(message_type.unwrap());
+    }
 }
 
 async fn deserialize_client_message(
