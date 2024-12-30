@@ -1,7 +1,5 @@
-use base64::read;
-
 use crate::atomic_register_public::AtomicRegister;
-use crate::{register_client_public, sectors_manager};
+use crate::register_client_public;
 use crate::register_client_public::RegisterClient;
 use crate::sectors_manager_public::SectorsManager;
 use std::sync::Arc;

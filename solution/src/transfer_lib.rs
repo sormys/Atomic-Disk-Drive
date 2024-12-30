@@ -223,15 +223,12 @@ pub async fn deserialize_data(
 ) -> Result<(RegisterCommand, bool), Error> {
     let mut received = Vec::new();
     let message_type = deserialize_header(data, &mut received).await?;
-    let mut hmac_key = Vec::new();
-    let cmd = match message_type {
+    let (hmac_key, cmd) = match message_type {
         MessageType::Client(client_message_type) => {
-            hmac_key = hmac_client_key.to_vec();
-            deserialize_client_message(client_message_type, data, &mut received).await?
+            (hmac_client_key.to_vec(), deserialize_client_message(client_message_type, data, &mut received).await?)
         }
         MessageType::System(system_message_type) => {
-            hmac_key = hmac_system_key.to_vec();
-            deserialize_system_message(system_message_type, data, &mut received).await?
+            (hmac_system_key.to_vec(), deserialize_system_message(system_message_type, data, &mut received).await?)
         }
     };
 

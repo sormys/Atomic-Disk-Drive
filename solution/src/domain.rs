@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 pub static MAGIC_NUMBER: [u8; 4] = [0x61, 0x74, 0x64, 0x64];
 
+#[derive(Debug)]
 pub struct Configuration {
     /// Hmac key to verify and sign internal requests.
     pub hmac_system_key: [u8; 64],

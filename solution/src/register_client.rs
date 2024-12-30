@@ -1,23 +1,19 @@
-use std::alloc::System;
 
-use async_channel::{unbounded, Receiver, Recv, Sender};
-use hmac::digest::consts::P1013;
+use async_channel::{unbounded, Sender};
 
-use crate::{register_client_public::*, RegisterCommand, SectorIdx, SystemRegisterCommand, SystemRegisterCommandContent};
-use crate::common::{ClientCallback, InternalCommand};
+use crate::{register_client_public::*, RegisterCommand, SystemRegisterCommand, SystemRegisterCommandContent};
+use crate::common::InternalCommand;
 
 #[derive(Clone)]
 pub(crate) struct BasicRegisterClient {
-    tcp_locations: Vec<(String, u16)>,
     senders: Vec<Sender<Box<SystemRegisterCommand>>>,
-    receivers: Vec<Receiver<Box<SystemRegisterCommand>>>,
     self_rank: u8,
     local_tx: Sender<InternalCommand>,
 }
 
 
 mod tcp {
-    use async_channel::{Sender, Receiver};
+    use async_channel::Receiver;
     use crate::{transfer_lib::serialize_command, SystemRegisterCommand};
     use crate::RegisterCommand;
 
@@ -97,9 +93,7 @@ impl BasicRegisterClient {
         }
 
         BasicRegisterClient {
-            tcp_locations,
             senders,
-            receivers,
             self_rank,
             local_tx
         }

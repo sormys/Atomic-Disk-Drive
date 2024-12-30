@@ -1,12 +1,7 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::os::linux::raw::stat;
-use std::os::unix::net::SocketAddr;
-use std::pin::Pin;
 use async_channel::Receiver;
 use async_channel::Sender;
 use tokio::sync::OwnedSemaphorePermit;
-use tokio::task::JoinHandle;
 
 use crate::common::InternalCommand;
 use crate::domain::*;
@@ -18,7 +13,6 @@ use tokio::io::AsyncWrite;
 use crate::register_client;
 use crate::atomic_register;
 use crate::sectors_manager;
-use crate::transfer_public::*;
 use tokio::net::TcpListener;
 use crate::common::ClientCallback;
 
