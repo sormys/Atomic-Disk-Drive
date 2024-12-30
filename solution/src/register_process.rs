@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use async_channel::Sender;
 use tokio::sync::OwnedSemaphorePermit;
 
+use crate::common;
 use crate::common::InternalCommand;
 use crate::domain::*;
 use crate::transfer_lib;
@@ -128,6 +129,7 @@ async fn handle_tcp_connection(stream: tokio::net::TcpStream, n_sectors: u64, hm
 }
 
 async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<InternalCommand>) {
+    let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
     while let Ok((stream, _socket)) = listener.accept().await {
         tokio::spawn(handle_tcp_connection(stream,
             n_sectors,
@@ -137,7 +139,7 @@ async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8;
     }
 }
 
-fn wrap_callback(callback: ClientCallback, semaphore_permit: OwnedSemaphorePermit) -> ClientCallback {
+fn wrap_permit_relase(callback: ClientCallback, semaphore_permit: OwnedSemaphorePermit) -> ClientCallback {
     Box::new(move |response: OperationSuccess| {
         let semaphore_permit = semaphore_permit;
         Box::pin(async move {
@@ -151,8 +153,9 @@ async fn process_command(aregister: Arc<Mutex<dyn AtomicRegister + Send>>, comma
     match command {
         RegisterCommand::Client(client_command) => {
             let semaphore_permit = semaphore.clone().acquire_owned().await.unwrap();
-            let callback = callback.map(|callback| wrap_callback(callback, semaphore_permit));
+            let callback = callback.map(|callback| wrap_permit_relase(callback, semaphore_permit));
             let mut aregister = aregister.lock().await;
+            // Only one client command can be processed at a time for single sector.
             aregister.client_command(client_command, callback.unwrap()).await;
         }
         RegisterCommand::System(system_command) => {
@@ -170,7 +173,7 @@ struct AtomicRegisterManager {
     register_client: Arc<register_client::BasicRegisterClient>,
     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
     process_count: u8,
-    rx: Receiver<InternalCommand>,
+    command_rx: Receiver<InternalCommand>,
 }
 
 impl AtomicRegisterManager {
@@ -190,7 +193,7 @@ impl AtomicRegisterManager {
             register_client,
             sectors_manager,
             process_count,
-            rx,
+            command_rx: rx,
         }
     }
 
@@ -226,7 +229,7 @@ impl AtomicRegisterManager {
         let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
         let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
     
-        while let Ok((sector_idx, command, is_write, callback)) = self.rx.recv().await {
+        while let Ok((sector_idx, command, is_write, callback)) = self.command_rx.recv().await {
             let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
                 if modified_atomic_registers.contains_key(&sector_idx) {
                     modified_atomic_registers.get(&sector_idx).unwrap().clone()
@@ -257,60 +260,6 @@ impl AtomicRegisterManager {
         }         
     }
 }
-
-// async fn manage_atomic_registers_task(
-//     process_count: u8,
-//     process_rank: u8,
-//     register_client: Arc<register_client::BasicRegisterClient>,
-//     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
-//     rx: Receiver<InternalCommand>) {
-//     let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
-//     let mut tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
-//     let mut tmp_atomic_registers_count: u64 = 0;
-//     let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
-//     const MAX_TMP_ATOMIC_REGISTERS: u64 = 700;
-
-//     while let Ok((sector_idx, command, is_write, callback)) = rx.recv().await {
-//         let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
-//             if modified_atomic_registers.contains_key(&sector_idx) {
-//                 modified_atomic_registers.get(&sector_idx).unwrap().clone()
-//             } else if is_write {
-//                 if tmp_atomic_registers.contains_key(&sector_idx) {
-//                     let atomic_register = tmp_atomic_registers.remove(&sector_idx).unwrap();
-//                     tmp_atomic_registers_count -= 1;
-//                     modified_atomic_registers.insert(sector_idx, atomic_register.clone());
-//                     atomic_register
-//                 } else {
-//                     let atomic_register = Arc::new(
-//                         Mutex::new(
-//                             atomic_register::BasicAtomicRegister::new(
-//                                 process_rank,
-//                                 sector_idx,
-//                                 register_client.clone(),
-//                                 sectors_manager.clone(),
-//                                 process_count,
-//                             )));
-//                     modified_atomic_registers.insert(sector_idx, atomic_register.clone());
-//                     atomic_register
-//                 }
-//             } else {
-//                 // TODO: limit the number of atomic registers
-//                 tmp_atomic_registers.entry(sector_idx).or_insert_with(|| {
-//                     tmp_atomic_registers_count += 1;
-//                     Arc::new(Mutex::new(atomic_register::BasicAtomicRegister::new(
-//                         process_rank,
-//                         sector_idx,
-//                         register_client.clone(),
-//                         sectors_manager.clone(),
-//                         process_count,
-//                     )))
-//                 }).clone()
-//             };
-//         let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
-//         tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
-//     }         
-// }
-
 
 pub(crate) async fn begin_register_process(config: Configuration, listener: TcpListener) {
     let (tx, rx) = unbounded::<InternalCommand>();

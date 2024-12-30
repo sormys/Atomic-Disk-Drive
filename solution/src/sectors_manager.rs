@@ -1,5 +1,5 @@
 // implementation of the SectorManager struct
-use crate::sectors_manager_public::SectorsManager;
+use crate::{common, sectors_manager_public::SectorsManager};
 use crate::SectorVec;
 use std::path::PathBuf;
 use sha2::{Sha256, Digest};
@@ -153,6 +153,7 @@ async fn recover_dir(dir_path: &PathBuf) {
 impl SectorsManager for BasicSectorsManager {
     
     async fn read_data(&self, idx: u64) -> SectorVec {
+        let _fd_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         let sector_dir = get_sector_dir(self.config_storage_dir.clone(), idx);
         let sector_data_path = get_sector_data_path(sector_dir);
         if !sector_data_path.exists() {
@@ -164,6 +165,7 @@ impl SectorsManager for BasicSectorsManager {
     }
 
     async fn read_metadata(&self, idx: u64) -> (u64, u8) {
+        let _fd_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         let sector_dir = get_sector_dir(self.config_storage_dir.clone(), idx);
         if !sector_dir.exists() {
             // No data about this sector yet.
@@ -189,6 +191,7 @@ impl SectorsManager for BasicSectorsManager {
         if sector.0.0.len() != 4096 {
             panic!("SectorVec must have 4096 bytes");
         }
+        let _fd_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         let (data_vec, timestamp, write_rank) = sector;
         let data = &data_vec.0;
 
@@ -244,6 +247,7 @@ impl BasicSectorsManager {
     }
 
     async fn full_recovery(&self){
+        let _fd_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         if !self.config_storage_dir.exists() {
             tokio::fs::create_dir(&self.config_storage_dir).await.unwrap();
         }

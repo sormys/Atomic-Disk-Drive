@@ -14,31 +14,28 @@ pub(crate) struct BasicRegisterClient {
 mod tcp {
     use async_channel::Receiver;
     use crate::{transfer_lib::serialize_command, SystemRegisterCommand};
-    use crate::RegisterCommand;
+    use crate::{common, RegisterCommand};
 
     static RETRY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(150);
     static CONN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
 
     pub(crate) async fn writing_task(host: String, port: u16, hmac_system_key: [u8; 64], forwarding_rx: Receiver<Box<SystemRegisterCommand>>) {
         let mut current_command = None;
+        let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         loop {
             let connection_attempt =
                 tokio::time::timeout(CONN_TIMEOUT, 
                     tokio::net::TcpStream::connect(format!("{}:{}", host, port))).await;
             match connection_attempt {
                 Err(_) => {
-                    log::debug!("Failed to connect before timeout to the {}:{}.", host, port);
                     tokio::time::sleep(RETRY_TIMEOUT).await;
                     continue;
                 }
                 Ok(Err(_)) => {
-                    log::debug!("Connection to the {}:{} refused", host, port);
                     tokio::time::sleep(RETRY_TIMEOUT).await;
                     continue;
                 }
                 Ok(Ok(stream)) => {
-                    log::debug!("Connected to the {}:{}.", host, port);
-
                     handle_out_connection(stream, &hmac_system_key, &mut current_command, &forwarding_rx).await;
                 }
             };

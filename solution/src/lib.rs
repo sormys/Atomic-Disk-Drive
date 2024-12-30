@@ -17,6 +17,7 @@ pub async fn run_register_process(config: Configuration) {
     let tcp_locations = config.public.tcp_locations.clone();
     let self_rank = config.public.self_rank;
 
+    let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
     let listener = tokio::net::TcpListener::bind(
         &tcp_locations[self_rank as usize - 1])
         .await
