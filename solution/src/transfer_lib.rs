@@ -37,7 +37,7 @@ enum Padding {
 // DESERIALIZATION
 
 
-pub async fn read_until_magic_number(
+pub(crate) async fn read_until_magic_number(
     data: &mut (dyn AsyncRead + Send + Unpin),
 ) -> Result<(), Error> {
     let mut buf = vec![0u8; MAGIC_NUMBER_LEN];
@@ -214,7 +214,7 @@ async fn verify_hmac(
     Ok(false)
 }
 
-pub async fn deserialize_data(
+pub(crate) async fn deserialize_data(
     data: &mut (dyn AsyncRead + Send + Unpin),
     hmac_system_key: &[u8; 64],
     hmac_client_key: &[u8; 32],
@@ -245,7 +245,7 @@ trait SerializeCommand {
     ) -> Result<(), Error>;
 }
 
-pub async fn serialize_command(
+pub(crate) async fn serialize_command(
     cmd: &RegisterCommand,
     writer: &mut (dyn AsyncWrite + Send + Unpin),
     hmac_key: &[u8],
@@ -306,7 +306,7 @@ impl SerializeCommand for ClientRegisterCommand {
     }
 }
 
-pub fn append_system_command_content(
+pub(crate) fn append_system_command_content(
     store_vector: &mut Vec<u8>, timestamp: &u64, write_rank: &u8, content: &SectorVec
 ) -> Result<(), Error> {
     // Timestamp
