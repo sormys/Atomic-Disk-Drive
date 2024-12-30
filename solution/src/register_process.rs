@@ -54,7 +54,7 @@ async fn handle_command(
 
     match command {
         RegisterCommand::Client(ClientRegisterCommand { header, content }) => {
-            if header.sector_idx > n_sectors {
+            if header.sector_idx >= n_sectors {
                 let msg_type = match content {
                     ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
                     ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,

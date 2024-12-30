@@ -414,9 +414,9 @@ pub(crate) async fn send_response(
     response.extend_from_slice(&MAGIC_NUMBER);
     response.extend_from_slice(&[0u8; Padding::SystemCommand as usize]);
     let status_code_raw: u8 = match status_code {
-        StatusCode::Ok => 1,
-        StatusCode::AuthFailure => 2,
-        StatusCode::InvalidSectorIndex => 3,
+        StatusCode::Ok => 0,
+        StatusCode::AuthFailure => 1,
+        StatusCode::InvalidSectorIndex => 2,
     };
     response.extend_from_slice(&status_code_raw.to_be_bytes());
     response.push(0x40u8 + msg_type);
