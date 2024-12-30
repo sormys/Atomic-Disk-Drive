@@ -21,7 +21,7 @@ mod tcp {
     use crate::{transfer_lib::serialize_command, SystemRegisterCommand};
     use crate::RegisterCommand;
 
-    static RETRY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(300);
+    static RETRY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(150);
     static CONN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
 
     pub(crate) async fn writing_task(host: String, port: u16, hmac_system_key: [u8; 64], forwarding_rx: Receiver<Box<SystemRegisterCommand>>) {
@@ -31,17 +31,17 @@ mod tcp {
                     tokio::net::TcpStream::connect(format!("{}:{}", host, port))).await;
             match connection_attempt {
                 Err(_) => {
-                    log::info!("Failed to connect before timeout to the {}:{}.", host, port);
+                    log::debug!("Failed to connect before timeout to the {}:{}.", host, port);
                     tokio::time::sleep(RETRY_TIMEOUT).await;
                     continue;
                 }
                 Ok(Err(_)) => {
-                    log::info!("Connection to the {}:{} refused", host, port);
+                    log::debug!("Connection to the {}:{} refused", host, port);
                     tokio::time::sleep(RETRY_TIMEOUT).await;
                     continue;
                 }
                 Ok(Ok(stream)) => {
-                    log::info!("Connected to the {}:{}.", host, port);
+                    log::debug!("Connected to the {}:{}.", host, port);
                     handle_out_connection(host, port, stream, &hmac_system_key, &forwarding_rx).await;
                     return;
                 }
@@ -89,7 +89,7 @@ impl BasicRegisterClient {
         }
 
         for (i, (ip, port)) in tcp_locations.iter().enumerate() {
-            if i == self_rank as usize {
+            if i + 1 == self_rank as usize {
                 // Do not listen for commands from self using tcp.
                 continue;
             }
