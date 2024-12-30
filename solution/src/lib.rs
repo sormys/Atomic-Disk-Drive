@@ -4,8 +4,8 @@ mod sectors_manager;
 mod atomic_register;
 mod register_client;
 mod register_process;
+mod common;
 
-use async_channel::unbounded;
 use register_process::begin_register_process;
 pub use crate::domain::*;
 pub use atomic_register_public::*;

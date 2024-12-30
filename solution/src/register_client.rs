@@ -4,7 +4,7 @@ use async_channel::{unbounded, Receiver, Recv, Sender};
 use hmac::digest::consts::P1013;
 
 use crate::{register_client_public::*, RegisterCommand, SectorIdx, SystemRegisterCommand, SystemRegisterCommandContent};
-use crate::register_process::ClientCallback;
+use crate::common::{ClientCallback, InternalCommand};
 
 #[derive(Clone)]
 pub(crate) struct BasicRegisterClient {
@@ -12,7 +12,7 @@ pub(crate) struct BasicRegisterClient {
     senders: Vec<Sender<Box<SystemRegisterCommand>>>,
     receivers: Vec<Receiver<Box<SystemRegisterCommand>>>,
     self_rank: u8,
-    local_tx: Sender<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>,
+    local_tx: Sender<InternalCommand>,
 }
 
 
@@ -75,10 +75,9 @@ mod tcp {
     }
 }
 
-// #Derive clone
 impl BasicRegisterClient {
     pub(crate) fn new(self_rank: u8, tcp_locations: Vec<(String, u16)>,
-        local_tx: Sender<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>, hmac_system_key: [u8; 64]) -> Self {
+        local_tx: Sender<InternalCommand>, hmac_system_key: [u8; 64]) -> Self {
         let mut senders = Vec::new();
         let mut receivers = Vec::new();
 
@@ -127,7 +126,7 @@ impl RegisterClient for BasicRegisterClient {
             return;
         }
         let cmd = Box::new((*msg.cmd).clone());
-        self.senders[dest as usize].send(cmd).await.unwrap();
+        self.senders[(dest - 1) as usize].send(cmd).await.unwrap();
     }
 
     async fn broadcast(&self, msg: Broadcast) {

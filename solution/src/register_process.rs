@@ -5,8 +5,10 @@ use std::os::unix::net::SocketAddr;
 use std::pin::Pin;
 use async_channel::Receiver;
 use async_channel::Sender;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 
+use crate::common::InternalCommand;
 use crate::domain::*;
 use crate::transfer_lib;
 use crate::transfer_public;
@@ -18,21 +20,11 @@ use crate::atomic_register;
 use crate::sectors_manager;
 use crate::transfer_public::*;
 use tokio::net::TcpListener;
-
+use crate::common::ClientCallback;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-pub(crate) type ClientCallback = Box<
-    dyn FnOnce(OperationSuccess) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync
-        >;
-
-
-struct RegisterProcess {
-    config: Configuration,
-}
+use tokio::sync::Semaphore;
 
 async fn handle_command(
     writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>,
@@ -40,7 +32,7 @@ async fn handle_command(
     hmac_valid: bool,
     hmac_client_key: [u8; 32],
     n_sectors: u64,
-    atomic_tx: Sender<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>
+    atomic_tx: Sender<InternalCommand>
     ) {
     if !hmac_valid {
         if let RegisterCommand::Client(ClientRegisterCommand { header, content}) = command{
@@ -67,6 +59,7 @@ async fn handle_command(
                     ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
                     ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,
                 };
+
                 let status_code = StatusCode::InvalidSectorIndex;
                 transfer_lib::send_response(
                     writer,
@@ -77,7 +70,7 @@ async fn handle_command(
                     hmac_client_key,
                 ).await;
                 return;
-            }
+            }   
             let callback = Some(client_callback(writer, hmac_client_key));
             let is_write = if let ClientRegisterCommandContent::Write {..} = content {
                 true
@@ -128,18 +121,18 @@ fn client_callback(
     })
 }
 
-async fn handle_tcp_connection(stream: tokio::net::TcpStream, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>) {
+async fn handle_tcp_connection(stream: tokio::net::TcpStream, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<InternalCommand>) {
     let (mut read, write) = stream.into_split();
 
     let write_arc = Arc::new(Mutex::new(write));
     while let Ok((command, hmac_valid)) =
-        transfer_public::deserialize_register_command(&mut read, &hmac_system_key, &hmac_client_key).await {
+        transfer_public::deserialize_register_command(&mut read, &hmac_system_key, &hmac_client_key).await {        
         handle_command(write_arc.clone(), command, hmac_valid, hmac_client_key, n_sectors, atomic_tx.clone()).await;
     }
 
 }
 
-async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>) {
+async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<InternalCommand>) {
     while let Ok((stream, _socket)) = listener.accept().await {
         tokio::spawn(handle_tcp_connection(stream,
             n_sectors,
@@ -149,13 +142,26 @@ async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8;
     }
 }
 
-async fn process_command(aregister: Arc<Mutex<dyn AtomicRegister + Send>>, command: RegisterCommand, callback: Option<ClientCallback>) {
-    let mut aregister = aregister.lock().await;
+fn wrap_callback(callback: ClientCallback, semaphore_permit: OwnedSemaphorePermit) -> ClientCallback {
+    Box::new(move |response: OperationSuccess| {
+        let semaphore_permit = semaphore_permit;
+        Box::pin(async move {
+            callback(response).await;
+            drop(semaphore_permit);
+        })
+    })
+}
+
+async fn process_command(aregister: Arc<Mutex<dyn AtomicRegister + Send>>, command: RegisterCommand, callback: Option<ClientCallback>, semaphore: Arc<Semaphore>) {
     match command {
         RegisterCommand::Client(client_command) => {
+            let semaphore_permit = semaphore.clone().acquire_owned().await.unwrap();
+            let callback = callback.map(|callback| wrap_callback(callback, semaphore_permit));
+            let mut aregister = aregister.lock().await;
             aregister.client_command(client_command, callback.unwrap()).await;
         }
         RegisterCommand::System(system_command) => {
+            let mut aregister = aregister.lock().await;
             aregister.system_command(system_command).await;
         }
     }
@@ -167,10 +173,11 @@ async fn manage_atomic_registers_task(
     process_rank: u8,
     register_client: Arc<register_client::BasicRegisterClient>,
     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
-    rx: Receiver<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>) {
+    rx: Receiver<InternalCommand>) {
     let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
     let mut tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
     let mut tmp_atomic_registers_count: u64 = 0;
+    let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
 
     while let Ok((sector_idx, command, is_write, callback)) = rx.recv().await {
         let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
@@ -208,13 +215,14 @@ async fn manage_atomic_registers_task(
                     )))
                 }).clone()
             };
-        tokio::spawn(async move {process_command(aregister, command, callback).await;});
+        let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
+        tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
     }         
 }
 
 
 pub(crate) async fn begin_register_process(config: Configuration, listener: TcpListener) {
-    let (tx, rx) = unbounded::<(SectorIdx, RegisterCommand, bool, Option<ClientCallback>)>();
+    let (tx, rx) = unbounded::<InternalCommand>();
     let rclient = Arc::new(register_client::BasicRegisterClient::new(
         config.public.self_rank,
         config.public.tcp_locations.clone(),
