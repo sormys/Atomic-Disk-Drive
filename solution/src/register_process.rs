@@ -22,73 +22,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
-async fn handle_command(
-    writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>,
-    command: RegisterCommand,
-    hmac_valid: bool,
-    hmac_client_key: [u8; 32],
-    n_sectors: u64,
-    atomic_tx: Sender<InternalCommand>
-    ) {
-    if !hmac_valid {
-        if let RegisterCommand::Client(ClientRegisterCommand { header, content}) = command{
-            let status_code = StatusCode::AuthFailure;
-            let msg_type = match content {
-                ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
-                ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,
-            };
-            transfer_lib::send_response(
-                writer,
-                status_code,
-                msg_type as u8,
-                header.request_identifier,
-                None,
-                hmac_client_key).await;
-        }
-        return;
-    }
-
-    match command {
-        RegisterCommand::Client(ClientRegisterCommand { header, content }) => {
-            if header.sector_idx >= n_sectors {
-                let msg_type = match content {
-                    ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
-                    ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,
-                };
-
-                let status_code = StatusCode::InvalidSectorIndex;
-                transfer_lib::send_response(
-                    writer,
-                    status_code,
-                    msg_type as u8,
-                    header.request_identifier,
-                    None,
-                    hmac_client_key,
-                ).await;
-                return;
-            }   
-            let callback = Some(client_callback(writer, hmac_client_key));
-            let is_write = if let ClientRegisterCommandContent::Write {..} = content {
-                true
-            } else {
-                false
-            };
-            atomic_tx.send((header.sector_idx,
-                RegisterCommand::Client(ClientRegisterCommand { header, content }),
-                is_write, callback)).await.unwrap();
-        }
-        RegisterCommand::System(SystemRegisterCommand { header, content }) => {
-            let is_write = match content {
-                SystemRegisterCommandContent::WriteProc {..} | SystemRegisterCommandContent::Value {..} => true,
-                SystemRegisterCommandContent::ReadProc | SystemRegisterCommandContent::Ack => false,
-            };
-            atomic_tx.send((header.sector_idx,
-                RegisterCommand::System(SystemRegisterCommand { header, content }),
-                is_write, None)).await.unwrap();
-        } 
-    }
-}
-
 fn client_callback(
     writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>,
     hmac_client_key: [u8; 32]) -> ClientCallback {
@@ -117,25 +50,104 @@ fn client_callback(
     })
 }
 
-async fn handle_tcp_connection(stream: tokio::net::TcpStream, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<InternalCommand>) {
-    let (mut read, write) = stream.into_split();
-
-    let write_arc = Arc::new(Mutex::new(write));
-    while let Ok((command, hmac_valid)) =
-        transfer_public::deserialize_register_command(&mut read, &hmac_system_key, &hmac_client_key).await {        
-        handle_command(write_arc.clone(), command, hmac_valid, hmac_client_key, n_sectors, atomic_tx.clone()).await;
-    }
-
+struct TcpAcceptedConnection {
+    n_sectors: u64,
+    hmac_system_key: [u8; 64],
+    hmac_client_key: [u8; 32],
+    command_tx: Sender<InternalCommand>,
 }
 
-async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], atomic_tx: Sender<InternalCommand>) {
-    let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
-    while let Ok((stream, _socket)) = listener.accept().await {
-        tokio::spawn(handle_tcp_connection(stream,
+impl TcpAcceptedConnection {
+    async fn new(n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], command_tx: Sender<InternalCommand>) -> Self {
+        Self {
             n_sectors,
             hmac_system_key,
             hmac_client_key,
-            atomic_tx.clone()));
+            command_tx,
+        }
+    }
+
+    async fn run(&mut self, stream: tokio::net::TcpStream) {
+        let (mut read, write) = stream.into_split();
+        let write_arc = Arc::new(Mutex::new(write));
+        while let Ok((command, hmac_valid)) =
+            transfer_public::deserialize_register_command(&mut read, &self.hmac_system_key, &self.hmac_client_key).await {
+            self.handle_command(write_arc.clone(), command, hmac_valid).await;
+        }
+    }
+
+    async fn invalid_hmac(&self, writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>, command: RegisterCommand) {
+        if let RegisterCommand::Client(ClientRegisterCommand { header, content}) = command{
+            let status_code = StatusCode::AuthFailure;
+            let msg_type = match content {
+                ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
+                ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,
+            };
+            transfer_lib::send_response(
+                writer,
+                status_code,
+                msg_type as u8,
+                header.request_identifier,
+                None,
+                self.hmac_client_key).await;
+        }
+    }
+
+    async fn handle_command(
+        &mut self,
+        writer: Arc<Mutex<dyn AsyncWrite + Send + Unpin>>,
+        command: RegisterCommand,
+        hmac_valid: bool,
+        ) {
+        if !hmac_valid {
+            self.invalid_hmac(writer, command).await;
+            return;
+        }
+    
+        match command {
+            RegisterCommand::Client(ClientRegisterCommand { header, content }) => {
+                if header.sector_idx >= self.n_sectors {
+                    let msg_type = match content {
+                        ClientRegisterCommandContent::Read => transfer_lib::ClientMessageType::Read,
+                        ClientRegisterCommandContent::Write { data: _data } => transfer_lib::ClientMessageType::Write,
+                    };
+    
+                    let status_code = StatusCode::InvalidSectorIndex;
+                    transfer_lib::send_response(
+                        writer,
+                        status_code,
+                        msg_type as u8,
+                        header.request_identifier,
+                        None,
+                        self.hmac_client_key,
+                    ).await;
+                    return;
+                }   
+                let callback = Some(client_callback(writer, self.hmac_client_key));
+                let is_write = matches!(content, ClientRegisterCommandContent::Write {..});
+                self.command_tx.send((header.sector_idx,
+                    RegisterCommand::Client(ClientRegisterCommand { header, content }),
+                    is_write, callback)).await.unwrap();
+            }
+            RegisterCommand::System(SystemRegisterCommand { header, content }) => {
+                let is_write = matches!(content,
+                        SystemRegisterCommandContent::WriteProc {..} | SystemRegisterCommandContent::Value {..});
+                self.command_tx.send((header.sector_idx,
+                    RegisterCommand::System(SystemRegisterCommand { header, content }),
+                    is_write, None)).await.unwrap();
+            } 
+        }
+    }
+}
+
+async fn listen_tcp(listener: TcpListener, n_sectors: u64, hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], command_tx: Sender<InternalCommand>) {
+    let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
+    while let Ok((stream, _socket)) = listener.accept().await {
+        let mut tcp_accepted_connection =
+            TcpAcceptedConnection::new(n_sectors, hmac_system_key, hmac_client_key, command_tx.clone()).await;
+        tokio::spawn(async move {
+            tcp_accepted_connection.run(stream).await;
+        });
     }
 }
 
