@@ -37,6 +37,8 @@ pub(crate) struct BasicAtomicRegister {
         + Sync
         >
         >,
+    data: Option<SectorVec>,
+    metadata: Option<(u64, u8)>,
 }
 
 impl BasicAtomicRegister {
@@ -63,7 +65,29 @@ impl BasicAtomicRegister {
             op_id: generate_unique_id(),
             request_identifier: 0,
             callback: None,
+            data: None,
+            metadata: None,
         }
+    }
+
+    async fn get_data(&mut self) -> &SectorVec {
+        if self.data.is_none() {
+            self.data = Some(self.sectors_manager.read_data(self.sector_idx).await);
+        }
+        self.data.as_ref().unwrap()
+    }
+
+    async fn get_metadata(&mut self) -> (u64, u8) {
+        if self.metadata.is_none() {
+            self.metadata = Some(self.sectors_manager.read_metadata(self.sector_idx).await);
+        }
+        self.metadata.unwrap()
+    }
+
+    async fn store(&mut self, data: SectorVec, ts: u64, wr: u8) {
+        self.sectors_manager.write(self.sector_idx, &(data.clone(), ts, wr)).await;
+        self.data = Some(data);
+        self.metadata = Some((ts, wr));
     }
 
     fn reset_read_list(&mut self) {
@@ -117,7 +141,6 @@ impl AtomicRegister for BasicAtomicRegister {
         self.reset_ack_list();
         let msg = match cmd.content {
             ClientRegisterCommandContent::Read => {
-                // println!("Read");
                 self.reading = true;
                 register_client_public::Broadcast {
                     cmd: Arc::new(SystemRegisterCommand{
@@ -131,7 +154,6 @@ impl AtomicRegister for BasicAtomicRegister {
                 }
             }
             ClientRegisterCommandContent::Write { data } => {
-                // println!("Write");
                 self.writing = true;
                 self.writing_data = Some(data);
                 register_client_public::Broadcast {
@@ -155,9 +177,8 @@ impl AtomicRegister for BasicAtomicRegister {
         let process_id = cmd.header.process_identifier;
         match cmd.content {
             SystemRegisterCommandContent::ReadProc => {
-                // println!("ReadProc");
-                let data = self.sectors_manager.read_data(self.sector_idx).await;
-                let (ts, wr) = self.sectors_manager.read_metadata(self.sector_idx).await;
+                let data = self.get_data().await.clone();
+                let (ts, wr) = self.get_metadata().await;
                 let msg = register_client_public::Send {
                     cmd: Arc::new(SystemRegisterCommand{
                         header: SystemCommandHeader{
@@ -176,7 +197,6 @@ impl AtomicRegister for BasicAtomicRegister {
                 self.register_client.send(msg).await;
             }
             SystemRegisterCommandContent::Value { timestamp, write_rank, sector_data } => {
-                // println!("Value");
                 if self.op_id != cmd.header.msg_ident || self.write_phase {
                     return;
                 }
@@ -188,8 +208,8 @@ impl AtomicRegister for BasicAtomicRegister {
                 self.read_list[(process_id - 1) as usize] = read_list_value;
                 self.read_list_num += 1;
                 if self.read_list_num > self.processes_count / 2 && (self.reading || self.writing) {
-                    let (ts, wr) = self.sectors_manager.read_metadata(self.sector_idx).await;
-                    let data = self.sectors_manager.read_data(self.sector_idx).await;
+                    let (ts, wr) = self.get_metadata().await;
+                    let data = self.get_data().await.clone();
                     self.read_list[(self.self_ident - 1) as usize] = Some((ts, wr, data));
 
                     let highest_idx = highest(&self.read_list);
@@ -202,10 +222,8 @@ impl AtomicRegister for BasicAtomicRegister {
                     if !self.reading {
                         (maxts, rr, readval) = (maxts + 1, self.self_ident, self.writing_data.take().unwrap());
 
-                        let writing = (readval, maxts, rr);
-                        self.sectors_manager.write(self.sector_idx,
-                            &writing).await;
-                        readval = writing.0;
+                        self.store(readval.clone(), maxts, rr).await;
+                        readval = readval;
                     }
                     let msg = register_client_public::Broadcast {
                         cmd: Arc::new(SystemRegisterCommand{
@@ -224,10 +242,9 @@ impl AtomicRegister for BasicAtomicRegister {
                 }
             }
             SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write } => {
-                // println!("WriteProc");
-                let (ts, wr) = self.sectors_manager.read_metadata(self.sector_idx).await;
+                let (ts, wr) = self.get_metadata().await;
                 if (timestamp, write_rank) > (ts, wr) {
-                    self.sectors_manager.write(self.sector_idx, &(data_to_write, timestamp, write_rank)).await;
+                    self.store(data_to_write, timestamp, write_rank).await;
                 }
                 self.register_client.send(register_client_public::Send {
                     cmd: Arc::new(SystemRegisterCommand{
@@ -242,7 +259,6 @@ impl AtomicRegister for BasicAtomicRegister {
                 }).await;
             }
             SystemRegisterCommandContent::Ack => {
-                // println!("ACK");
                 if cmd.header.msg_ident != self.op_id || !self.write_phase {
                     return;
                 }
@@ -269,9 +285,7 @@ impl AtomicRegister for BasicAtomicRegister {
                         request_identifier: self.request_identifier,
                         op_return: op_ret,
                     };
-                    // println!("success start");
                     self.callback.take().unwrap()(success).await;
-                    // println!("success end");
                 }
             }
         }
