@@ -181,6 +181,7 @@ struct AtomicRegisterManager {
     tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<atomic_register::BasicAtomicRegister>>>,
     tmp_atomic_registers_order: VecDeque<SectorIdx>,
     tmp_atomic_registers_count: usize,
+    semaphores: HashMap<SectorIdx, Arc<Semaphore>>,
     process_rank: u8,
     register_client: Arc<register_client::BasicRegisterClient>,
     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
@@ -201,6 +202,7 @@ impl AtomicRegisterManager {
             tmp_atomic_registers: HashMap::new(),
             tmp_atomic_registers_order: VecDeque::new(),
             tmp_atomic_registers_count: 0,
+            semaphores: HashMap::new(),
             process_rank,
             register_client,
             sectors_manager,
@@ -217,9 +219,10 @@ impl AtomicRegisterManager {
 
         // Remove the oldest register to limit amount of registers without writes.
         if self.tmp_atomic_registers_count >= Self::MAX_TMP_ATOMIC_REGISTERS {
-             if let Some(oldest_sector_idx) = self.tmp_atomic_registers_order.pop_front() {
+            if let Some(oldest_sector_idx) = self.tmp_atomic_registers_order.pop_front() {
                 self.tmp_atomic_registers.remove(&oldest_sector_idx);
                 self.tmp_atomic_registers_count -= 1;
+                self.semaphores.remove(&oldest_sector_idx);
             }
         }
 
@@ -239,7 +242,6 @@ impl AtomicRegisterManager {
 
     async fn run(&mut self) {
         let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
-        let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
     
         while let Ok((sector_idx, command, is_write, callback)) = self.command_rx.recv().await {
             let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
@@ -267,7 +269,7 @@ impl AtomicRegisterManager {
                 } else {
                     self.get_or_insert_tmp_atomic_register(sector_idx)
                 };
-            let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
+            let semaphore = self.semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
             tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
         }         
     }

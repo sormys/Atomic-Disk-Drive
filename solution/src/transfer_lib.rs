@@ -48,11 +48,9 @@ pub async fn read_until_magic_number(
         pos = (pos + 1) % MAGIC_NUMBER_LEN;
 
         if buf[pos..].iter().chain(&buf[..pos]).eq(MAGIC_NUMBER.iter()) {
-            break;
+            return Ok(());
         }
     }
-
-    Ok(())
 }
 
 async fn deserialize_header(

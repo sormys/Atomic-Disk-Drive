@@ -19,7 +19,7 @@ mod tcp {
     static RETRY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(150);
     static CONN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
 
-    pub(crate) async fn writing_task(host: String, port: u16, hmac_system_key: [u8; 64], forwarding_rx: Receiver<Box<SystemRegisterCommand>>) {
+    pub(crate) async fn connect_to_process(host: String, port: u16, hmac_system_key: [u8; 64], forwarding_rx: Receiver<Box<SystemRegisterCommand>>) {
         let mut current_command = None;
         let _semaphore_permit = common::FD_SEMAPHORE.acquire().await.unwrap();
         loop {
@@ -27,22 +27,18 @@ mod tcp {
                 tokio::time::timeout(CONN_TIMEOUT, 
                     tokio::net::TcpStream::connect(format!("{}:{}", host, port))).await;
             match connection_attempt {
-                Err(_) => {
-                    tokio::time::sleep(RETRY_TIMEOUT).await;
-                    continue;
-                }
-                Ok(Err(_)) => {
+                Err(_) | Ok(Err(_)) => {
                     tokio::time::sleep(RETRY_TIMEOUT).await;
                     continue;
                 }
                 Ok(Ok(stream)) => {
-                    handle_out_connection(stream, &hmac_system_key, &mut current_command, &forwarding_rx).await;
+                    forward_commands(stream, &hmac_system_key, &mut current_command, &forwarding_rx).await;
                 }
             };
         }
     }
 
-    pub(crate) async fn handle_out_connection(
+    pub(crate) async fn forward_commands(
             mut stream: tokio::net::TcpStream,
             hmac_system_key: &[u8; 64],
             current_command: &mut Option<RegisterCommand>, // Placeholder for failed command to be retried.
@@ -74,6 +70,7 @@ impl BasicRegisterClient {
         let mut receivers = Vec::new();
 
         // Create channels to store all commands before tcp communication.
+        // Channel for self is just a placeholder - it will not be used.
         for _location in tcp_locations.iter() {
             let (tx, rx) = unbounded::<Box<SystemRegisterCommand>>();
             senders.push(tx);
@@ -85,7 +82,7 @@ impl BasicRegisterClient {
                 // Do not listen for commands from self using tcp.
                 continue;
             }
-            tokio::spawn(tcp::writing_task(ip.clone(), *port, hmac_system_key, receivers[i].clone()));
+            tokio::spawn(tcp::connect_to_process(ip.clone(), *port, hmac_system_key, receivers[i].clone()));
         }
 
         BasicRegisterClient {
@@ -110,18 +107,18 @@ impl BasicRegisterClient {
 impl RegisterClient for BasicRegisterClient {
 
     async fn send(&self, msg: Send) {
-        let dest = msg.target;
         if msg.target == self.self_rank {
             self.send_local(msg).await;
             return;
         }
         let cmd = Box::new((*msg.cmd).clone());
-        self.senders[(dest - 1) as usize].send(cmd).await.unwrap();
+        self.senders[(msg.target - 1) as usize].send(cmd).await.unwrap();
     }
 
     async fn broadcast(&self, msg: Broadcast) {
         let cmd = Box::new((*msg.cmd).clone());
         let mut tcp_sent = Vec::new();
+        // Trigger tcp send first to reduce latency.
         for (i, s) in self.senders.iter().enumerate() {
             if i + 1 == self.self_rank as usize {
                 continue;
