@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use async_channel::Receiver;
+use std::collections::VecDeque;
 use async_channel::Sender;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -161,58 +162,154 @@ async fn process_command(aregister: Arc<Mutex<dyn AtomicRegister + Send>>, comma
     }
 }
 
-
-async fn manage_atomic_registers_task(
-    process_count: u8,
+struct AtomicRegisterManager {
+    tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<atomic_register::BasicAtomicRegister>>>,
+    tmp_atomic_registers_order: VecDeque<SectorIdx>,
+    tmp_atomic_registers_count: usize,
     process_rank: u8,
     register_client: Arc<register_client::BasicRegisterClient>,
     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
-    rx: Receiver<InternalCommand>) {
-    let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
-    let mut tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
-    let mut tmp_atomic_registers_count: u64 = 0;
-    let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
-
-    while let Ok((sector_idx, command, is_write, callback)) = rx.recv().await {
-        let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
-            if modified_atomic_registers.contains_key(&sector_idx) {
-                modified_atomic_registers.get(&sector_idx).unwrap().clone()
-            } else if is_write {
-                if tmp_atomic_registers.contains_key(&sector_idx) {
-                    let atomic_register = tmp_atomic_registers.remove(&sector_idx).unwrap();
-                    tmp_atomic_registers_count -= 1;
-                    modified_atomic_registers.insert(sector_idx, atomic_register.clone());
-                    atomic_register
-                } else {
-                    let atomic_register = Arc::new(
-                        Mutex::new(
-                            atomic_register::BasicAtomicRegister::new(
-                                process_rank,
-                                sector_idx,
-                                register_client.clone(),
-                                sectors_manager.clone(),
-                                process_count,
-                            )));
-                    modified_atomic_registers.insert(sector_idx, atomic_register.clone());
-                    atomic_register
-                }
-            } else {
-                // TODO: limit the number of atomic registers
-                tmp_atomic_registers.entry(sector_idx).or_insert_with(|| {
-                    tmp_atomic_registers_count += 1;
-                    Arc::new(Mutex::new(atomic_register::BasicAtomicRegister::new(
-                        process_rank,
-                        sector_idx,
-                        register_client.clone(),
-                        sectors_manager.clone(),
-                        process_count,
-                    )))
-                }).clone()
-            };
-        let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
-        tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
-    }         
+    process_count: u8,
+    rx: Receiver<InternalCommand>,
 }
+
+impl AtomicRegisterManager {
+    const MAX_TMP_ATOMIC_REGISTERS: usize = 400;
+    fn new(
+        process_rank: u8,
+        register_client: Arc<register_client::BasicRegisterClient>,
+        sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
+        process_count: u8,
+        rx: Receiver<InternalCommand>,
+    ) -> Self {
+        Self {
+            tmp_atomic_registers: HashMap::new(),
+            tmp_atomic_registers_order: VecDeque::new(),
+            tmp_atomic_registers_count: 0,
+            process_rank,
+            register_client,
+            sectors_manager,
+            process_count,
+            rx,
+        }
+    }
+
+    fn get_or_insert_tmp_atomic_register(&mut self, sector_idx: SectorIdx) -> Arc<Mutex<atomic_register::BasicAtomicRegister>> {
+        if self.tmp_atomic_registers.contains_key(&sector_idx) {
+            return self.tmp_atomic_registers.get(&sector_idx).unwrap().clone();
+        }
+        // No register for sector available. 
+
+        // Remove the oldest register to limit amount of registers without writes.
+        if self.tmp_atomic_registers_count >= Self::MAX_TMP_ATOMIC_REGISTERS {
+             if let Some(oldest_sector_idx) = self.tmp_atomic_registers_order.pop_front() {
+                self.tmp_atomic_registers.remove(&oldest_sector_idx);
+                self.tmp_atomic_registers_count -= 1;
+            }
+        }
+
+        let new_register = Arc::new(Mutex::new(atomic_register::BasicAtomicRegister::new(
+            self.process_rank,
+            sector_idx,
+            self.register_client.clone(),
+            self.sectors_manager.clone(),
+            self.process_count,
+        )));
+        self.tmp_atomic_registers.insert(sector_idx, new_register.clone());
+        self.tmp_atomic_registers_order.push_back(sector_idx);
+        self.tmp_atomic_registers_count += 1;
+    
+        new_register
+    }
+
+    async fn run(&mut self) {
+        let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
+        let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
+    
+        while let Ok((sector_idx, command, is_write, callback)) = self.rx.recv().await {
+            let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
+                if modified_atomic_registers.contains_key(&sector_idx) {
+                    modified_atomic_registers.get(&sector_idx).unwrap().clone()
+                } else if is_write {
+                    if self.tmp_atomic_registers.contains_key(&sector_idx) {
+                        let atomic_register = self.tmp_atomic_registers.remove(&sector_idx).unwrap();
+                        self.tmp_atomic_registers_count -= 1;
+                        modified_atomic_registers.insert(sector_idx, atomic_register.clone());
+                        atomic_register
+                    } else {
+                        let atomic_register = Arc::new(
+                            Mutex::new(
+                                atomic_register::BasicAtomicRegister::new(
+                                    self.process_rank,
+                                    sector_idx,
+                                    self.register_client.clone(),
+                                    self.sectors_manager.clone(),
+                                    self.process_count,
+                                )));
+                        modified_atomic_registers.insert(sector_idx, atomic_register.clone());
+                        atomic_register
+                    }
+                } else {
+                    self.get_or_insert_tmp_atomic_register(sector_idx)
+                };
+            let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
+            tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
+        }         
+    }
+}
+
+// async fn manage_atomic_registers_task(
+//     process_count: u8,
+//     process_rank: u8,
+//     register_client: Arc<register_client::BasicRegisterClient>,
+//     sectors_manager: Arc<sectors_manager::BasicSectorsManager>,
+//     rx: Receiver<InternalCommand>) {
+//     let mut modified_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
+//     let mut tmp_atomic_registers: HashMap<SectorIdx, Arc<Mutex<dyn AtomicRegister + Send>>> = HashMap::new();
+//     let mut tmp_atomic_registers_count: u64 = 0;
+//     let mut semaphores: HashMap<SectorIdx, Arc<Semaphore>> = HashMap::new();
+//     const MAX_TMP_ATOMIC_REGISTERS: u64 = 700;
+
+//     while let Ok((sector_idx, command, is_write, callback)) = rx.recv().await {
+//         let aregister: Arc<Mutex<dyn AtomicRegister + Send>> = 
+//             if modified_atomic_registers.contains_key(&sector_idx) {
+//                 modified_atomic_registers.get(&sector_idx).unwrap().clone()
+//             } else if is_write {
+//                 if tmp_atomic_registers.contains_key(&sector_idx) {
+//                     let atomic_register = tmp_atomic_registers.remove(&sector_idx).unwrap();
+//                     tmp_atomic_registers_count -= 1;
+//                     modified_atomic_registers.insert(sector_idx, atomic_register.clone());
+//                     atomic_register
+//                 } else {
+//                     let atomic_register = Arc::new(
+//                         Mutex::new(
+//                             atomic_register::BasicAtomicRegister::new(
+//                                 process_rank,
+//                                 sector_idx,
+//                                 register_client.clone(),
+//                                 sectors_manager.clone(),
+//                                 process_count,
+//                             )));
+//                     modified_atomic_registers.insert(sector_idx, atomic_register.clone());
+//                     atomic_register
+//                 }
+//             } else {
+//                 // TODO: limit the number of atomic registers
+//                 tmp_atomic_registers.entry(sector_idx).or_insert_with(|| {
+//                     tmp_atomic_registers_count += 1;
+//                     Arc::new(Mutex::new(atomic_register::BasicAtomicRegister::new(
+//                         process_rank,
+//                         sector_idx,
+//                         register_client.clone(),
+//                         sectors_manager.clone(),
+//                         process_count,
+//                     )))
+//                 }).clone()
+//             };
+//         let semaphore = semaphores.entry(sector_idx).or_insert_with(|| Arc::new(Semaphore::new(1))).clone();
+//         tokio::spawn(async move {process_command(aregister, command, callback, semaphore).await;});
+//     }         
+// }
 
 
 pub(crate) async fn begin_register_process(config: Configuration, listener: TcpListener) {
@@ -225,7 +322,16 @@ pub(crate) async fn begin_register_process(config: Configuration, listener: TcpL
     ));
     let process_count = config.public.tcp_locations.len() as u8;
     let smanager = Arc::new(sectors_manager::BasicSectorsManager::new(&config.public.storage_dir).await);
-    tokio::spawn(manage_atomic_registers_task(process_count, config.public.self_rank, rclient.clone(), smanager.clone(), rx));
+    let mut atomic_register_manager = AtomicRegisterManager::new(
+        config.public.self_rank,
+        rclient.clone(),
+        smanager.clone(),
+        process_count,
+        rx,
+    );
+    tokio::spawn(async move {
+        atomic_register_manager.run().await;
+    });
     listen_tcp(listener,
         config.public.n_sectors, config.hmac_system_key,
         config.hmac_client_key, tx).await;

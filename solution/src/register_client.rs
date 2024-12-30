@@ -11,7 +11,6 @@ pub(crate) struct BasicRegisterClient {
     local_tx: Sender<InternalCommand>,
 }
 
-
 mod tcp {
     use async_channel::Receiver;
     use crate::{transfer_lib::serialize_command, SystemRegisterCommand};
@@ -21,6 +20,7 @@ mod tcp {
     static CONN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(500);
 
     pub(crate) async fn writing_task(host: String, port: u16, hmac_system_key: [u8; 64], forwarding_rx: Receiver<Box<SystemRegisterCommand>>) {
+        let mut current_command = None;
         loop {
             let connection_attempt =
                 tokio::time::timeout(CONN_TIMEOUT, 
@@ -38,34 +38,33 @@ mod tcp {
                 }
                 Ok(Ok(stream)) => {
                     log::debug!("Connected to the {}:{}.", host, port);
-                    handle_out_connection(host, port, stream, &hmac_system_key, &forwarding_rx).await;
-                    return;
+
+                    handle_out_connection(stream, &hmac_system_key, &mut current_command, &forwarding_rx).await;
                 }
             };
         }
     }
 
     pub(crate) async fn handle_out_connection(
-            host: String,
-            port: u16,
             mut stream: tokio::net::TcpStream,
             hmac_system_key: &[u8; 64],
+            current_command: &mut Option<RegisterCommand>, // Placeholder for failed command to be retried.
             forwarding_rx: &Receiver<Box<SystemRegisterCommand>>) {
+        
         loop {
-            let command = forwarding_rx.recv().await;
-            match command {
-                Ok(command) => {
-                    let command = RegisterCommand::System(*command);
-                    let sent = serialize_command(&command, &mut stream, &hmac_system_key[..]).await;
-                    if sent.is_err() {
-                        log::warn!("Failed to send command to the {}:{} (serialization error?).", host, port);
-                        return;
-                    }
+            if current_command.is_none() {
+                match forwarding_rx.try_recv() {
+                    Ok(command) => { current_command.replace(RegisterCommand::System(*command)); },
+                    Err(_) => {return;}
                 }
-                Err(_) => {
-                    log::warn!("Forwarding channel closed.");
-                    return;
-                }
+            }
+            
+            if !serialize_command(current_command.as_ref().unwrap(), &mut stream, &hmac_system_key[..]).await.is_err() {
+                // No error, no need to retry sending the command.
+                *current_command = None;
+            } else {
+                // Error, current_command should be retried.
+                return;
             }
         }
     }
